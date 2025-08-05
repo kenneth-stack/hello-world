@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Moves .csv files from /bankfile/error/ in staging to landing bucket
+
+Parameters:
+  LambdaRoleArn:
+    Type: String
+    Description: ARN of the IAM role for Lambda
+    Default: arn:aws:iam::448049811908:role/delegatedadmin/developer/LambdaS3Access
+  LambdaFunctionName:
+    Type: String
+    Description: Lambda function name
+    Default: mtfpm-dev-lambda-move-error-csvs
+  MtfdmSourceBucket:  # Staging bucket
+    Type: String
+    Description: mtfdm STAGING bucket (source of files)
+    Default: mtfpm-dev-s3-mtfdmstaging-us-east-1
+  MtfdmLandingBucket:  # Landing bucket
+    Type: String
+    Description: mtfdm LANDING bucket (destination)
+    Default: mtfpm-dev-s3-mtfdm-us-east-1
+  Mtfdm2SourceBucket:  # Staging bucket
+    Type: String
+    Description: mtfdm2 STAGING bucket (source of files)
+    Default: mtfpm-dev2-s3-mtfdmstaging-us-east-1
+  Mtfdm2LandingBucket:  # Landing bucket
+    Type: String
+    Description: mtfdm2 LANDING bucket (destination)
+    Default: mtfpm-dev2-s3-mtfdm-us-east-1
+
+Resources:
+  ErrorCSVMoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Layers: [arn:aws:lambda:us-east-1:448049811908:layer:cfnresponse:1]
+      Environment:
+        Variables:
+          ERROR_PREFIX: "bankfile/error/"
+          LAMBDA_EMAIL: !ImportValue MTFPM-LAMBDA-S3-EMAIL-LambdaFunctionName
+          MTFDM_STAGING: !Ref MtfdmSourceBucket
+          MTFDM_LANDING: !Ref MtfdmLandingBucket
+          MTFDM2_STAGING: !Ref Mtfdm2SourceBucket
+          MTFDM2_LANDING: !Ref Mtfdm2LandingBucket
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !Ref LambdaRoleArn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.parse
+
+          s3 = boto3.client('s3')
+          lambda_client = boto3.client('lambda')
+          error_prefix = os.environ['ERROR_PREFIX']
+          email_lambda = os.environ['LAMBDA_EMAIL']
+
+          def get_landing_bucket(staging_bucket):
+              if staging_bucket == os.environ['MTFDM_STAGING']:
+                  return os.environ['MTFDM_LANDING']
+              elif staging_bucket == os.environ['MTFDM2_STAGING']:
+                  return os.environ['MTFDM2_LANDING']
+              return staging_bucket.replace("staging", "landing")
+
+          def send_email(event):
+              lambda_client.invoke(
+                  FunctionName=email_lambda,
+                  InvocationType="Event",
+                  Payload=json.dumps(event)
+              )
+
+          def lambda_handler(event, context):
+              # Process S3 event triggers (new files)
+              if 'Records' in event:
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                      
+                      if key.startswith(error_prefix) and key.endswith('.csv'):
+                          landing_bucket = get_landing_bucket(bucket)
+                          try:
+                              s3.copy_object(
+                                  Bucket=landing_bucket,
+                                  Key=key,
+                                  CopySource={'Bucket': bucket, 'Key': key}
+                              )
+                              print(f"Moved {key} to {landing_bucket}")
+                              send_email(event)  # Notify on successful move
+                          except Exception as e:
+                              print(f"Failed to move {key}: {str(e)}")
+              
+              # Batch process existing error files (if needed)
+              for staging_bucket in [os.environ['MTFDM_STAGING'], os.environ['MTFDM2_STAGING']]:
+                  response = s3.list_objects_v2(
+                      Bucket=staging_bucket,
+                      Prefix=error_prefix
+                  )
+                  
+                  if 'Contents' in response:
+                      for item in response['Contents']:
+                          if item['Key'].endswith('.csv'):
+                              landing_bucket = get_landing_bucket(staging_bucket)
+                              try:
+                                  s3.copy_object(
+                                      Bucket=landing_bucket,
+                                      Key=item['Key'],
+                                      CopySource={'Bucket': staging_bucket, 'Key': item['Key']}
+                                  )
+                                  print(f"Moved {item['Key']} to {landing_bucket}")
+                                  # Simulate an S3 event for email notification
+                                  fake_event = {
+                                      "Records": [{
+                                          "s3": {
+                                              "bucket": {"name": staging_bucket},
+                                              "object": {"key": item['Key']}
+                                          }
+                                      }]
+                                  }
+                                  send_email(fake_event)
+                              except Exception as e:
+                                  print(f"Failed to move {item['Key']}: {str(e)}")
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Error CSV processing complete'
+              }
+
+Outputs:
+  LambdaFunctionName:
+    Value: !Ref LambdaFunctionName
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaFunctionName
+  LambdaFunctionArn:
+    Value: !GetAtt ErrorCSVMoverFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaFunctionArn
